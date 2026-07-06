@@ -210,7 +210,16 @@ void vi_thread_func() {
         total_vis = new_total_vis;
 
         // If the game hasn't started yet, set a dummy VI mode and origin.
-        if (!ultramodern::is_game_started()) {
+        // Also install the dummy mode if the game IS "started" but has not yet
+        // handed us a real VI mode via osViSetMode (next_state->mode still null).
+        // Without this second condition there is a startup race: if start_game()
+        // sets game_status=Running before/at the moment preinit() spawns this VI
+        // thread, the very first tick sees is_game_started()==true, skips the dummy
+        // path, and update_vi() below dereferences a null next_state->mode
+        // (&next_mode->comRegs, fault @+0x1c) → SIGSEGV. Guarding on a null mode
+        // makes the ordering race-safe (and covers the general "running but no VI
+        // mode set yet" window before the game's first osViSetMode).
+        if (!ultramodern::is_game_started() || events_context.vi.get_next_state()->mode == nullptr) {
             static bool odd = false;
             set_dummy_vi(odd);
             odd = !odd;

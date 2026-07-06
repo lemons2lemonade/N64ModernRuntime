@@ -406,6 +406,20 @@ enum class StatusReg {
     FR = 0x04000000,
 };
 
+// COP0 Status bits that this HLE model can safely tolerate on a write (i.e. they
+// only need to be stored so a later mfc0 reads them back — they do not drive any
+// modeled behavior). The only bit with real semantics here is FR (float register
+// aliasing), handled explicitly above. Everything else — the coprocessor-usable
+// bits (CU0..CU3, incl. CU1=0x20000000 which games set to enable the FPU), the
+// mode/exception-level bits (KSU/ERL/EXL/IE), the interrupt masks (IM), and the
+// diagnostic/status flags (RP/RE/DS/SR/TS/BEV/CH/CE/DE/UX/SX/KX/NMI) — is inert in
+// the flat-rdram HLE (there is no real COP0 exception or interrupt machinery;
+// interrupts are delivered via the message-queue HLE). Accept them instead of
+// aborting the whole process. This unblocks the Paperboy boot, whose boot-main
+// enables the FPU via `mtc0 STATUS` with CU1 set (0x20000000) and previously hit
+// the hard exit() below with "Unhandled status register bits changed: 0x20000000".
+static constexpr uint32_t STATUS_TOLERATED_BITS = 0xFBFFFFFFu; // everything except FR (handled explicitly)
+
 extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
     uint32_t old_sr = ctx->status_reg;
     uint32_t new_sr = (uint32_t)value;
@@ -430,19 +444,37 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
         changed &= ~(uint32_t)StatusReg::FR;
     }
 
-    // If any other bits were changed, assert false as they're not handled currently
-    if (changed) {
-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
-        assert(false);
-        exit(EXIT_FAILURE);
+    // Tolerate all remaining Status bits: they carry no behavior in this HLE model,
+    // so just let them be stored below. (Previously any other changed bit aborted the
+    // whole process via assert()+exit(), which killed the Paperboy boot on the CU1
+    // FPU-enable bit.) Warn ONCE if a bit outside the known-tolerated mask changes, so
+    // a genuinely novel bit is still visible without taking the program down.
+    uint32_t unexpected = changed & ~STATUS_TOLERATED_BITS;
+    if (unexpected) {
+        static bool warned = false;
+        if (!warned) {
+            printf("[cop0_status_write] tolerating unmodeled status bits: 0x%08X (storing without effect)\n", unexpected);
+            warned = true;
+        }
     }
-    
-    // Update the status register in the context
+
+    // Update the status register in the context (so a subsequent cop0_status_read
+    // returns exactly what the game wrote).
     ctx->status_reg = new_sr;
 }
 
 extern "C" gpr cop0_status_read(recomp_context* ctx) {
     return (gpr)(int32_t)ctx->status_reg;
+}
+
+extern "C" gpr cop0_cause_read(recomp_context* ctx) {
+    // COP0 Cause ($13). This HLE runs no real COP0 exception/interrupt machinery (interrupts are
+    // delivered via the message-queue HLE), so nothing is ever pending: report 0. Games' boot IPL
+    // reads Cause and branches on the pending-interrupt bits (e.g. Paperboy: `andi Cause,0x1000;
+    // bnez -> spin`); returning 0 takes the normal (no-pending) path. Sign-extended like the other
+    // 32-bit COP0 reads.
+    (void)ctx;
+    return (gpr)(int32_t)0;
 }
 
 extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
@@ -767,6 +799,21 @@ void recomp::start(const recomp::Configuration& cfg) {
 
     // Allocate rdram without comitting it. Use a platform-specific virtual allocation function
     // that initializes to zero. Protect the region above the memory size to catch accesses to invalid addresses.
+    //
+    // KSEG1 raw-MMIO window (Wall 3): the recompiled memory model is flat rdram indexed by
+    // (guest_vaddr - 0x80000000), so a KSEG0 address 0x80000000+x reads rdram[x] (committed by
+    // `mem_size`). But games' boot/IPL code also performs RAW loads/stores through KSEG1
+    // (0xA0000000-0xBFFFFFFF) — e.g. Paperboy's PIF/SI boot handshake polls SI_STATUS at
+    // 0xA4800018 and read/writes PIF RAM at 0xBFC007xx directly, rather than via the osSi/osPi
+    // HLE. Those addresses map to offsets [0x20000000, 0x40000000) (== [512MB, 1GB)), which is
+    // reserved-but-uncommitted -> EXC_BAD_ACCESS (measured fault addr rdram+0x24800018 in the SI
+    // poll). Commit that 512MB KSEG1 window READ/WRITE so those raw accesses do not fault. Fresh
+    // pages are zero, which is exactly the "not busy / ready" value every boot poll wants (the SI
+    // pollers loop while SI_STATUS&3 != 0, so reading 0 terminates them immediately) and makes the
+    // PIF-RAM handshake reads/writes benign. The out-of-bounds guard is preserved everywhere else
+    // (the gap above the KSEG1 window, and KUSEG below KSEG0, stay PROT_NONE).
+    constexpr size_t kseg1_offset = 0x20000000ULL; // guest 0xA0000000 - 0x80000000
+    constexpr size_t kseg1_size   = 0x20000000ULL; // 0xA0000000..0xBFFFFFFF (512MB)
     uint8_t* rdram;
     bool alloc_failed;
 #ifdef _WIN32
@@ -780,12 +827,26 @@ void recomp::start(const recomp::Configuration& cfg) {
             VirtualFree(rdram, 0, MEM_RELEASE);
         }
     }
+    if (!alloc_failed) {
+        // Commit the KSEG1 raw-MMIO window (see note above).
+        alloc_failed = (VirtualProtect(rdram + kseg1_offset, kseg1_size, PAGE_READWRITE, &old_protect) == 0);
+        if (alloc_failed) {
+            VirtualFree(rdram, 0, MEM_RELEASE);
+        }
+    }
 #else
     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
     if (!alloc_failed) {
         // mprotect returns -1 on failure.
         alloc_failed = (mprotect(rdram, mem_size, PROT_READ | PROT_WRITE) == -1);
+        if (alloc_failed) {
+            munmap(rdram, allocation_size);
+        }
+    }
+    if (!alloc_failed) {
+        // Commit the KSEG1 raw-MMIO window (see note above).
+        alloc_failed = (mprotect(rdram + kseg1_offset, kseg1_size, PROT_READ | PROT_WRITE) == -1);
         if (alloc_failed) {
             munmap(rdram, allocation_size);
         }
