@@ -2,12 +2,15 @@
 #include <fstream>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <mutex>
 #include "recomp.h"
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
+#include "librecomp/overlays.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 
@@ -269,10 +272,40 @@ void ultramodern::join_saving_thread() {
 void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
     // TODO asynchronous transfer
     // TODO implement unaligned DMA correctly
+    static const bool s_dma_trace = std::getenv("MC_DMA_TRACE") != nullptr;
+    if (s_dma_trace) {
+        fprintf(stderr, "[dma] dir=%u rom=0x%08X ram=0x%08X size=0x%X\n",
+                direction, physical_addr, (uint32_t)rdram_address, size);
+    }
     if (direction == 0) {
         if (physical_addr >= recomp::rom_base) {
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+
+            // Overlay relocation hook: Pokemon Stadium 2 (and its engine family) DMAs its 88
+            // relocatable code "fragments" from ROM to a RUNTIME address that differs from the
+            // fragment's link-time vram (e.g. fragment67 link 0x82900000 -> runtime 0x801451A0),
+            // then calls into them via function pointer. When a DMA lands ANY bytes of a
+            // fragment's ROM range, register that fragment's functions in func_map at the loaded
+            // runtime address and set section_addresses[idx] so the fragment's RELOC_HI16/LO16
+            // self-references resolve to the runtime base. load_overlays() is overlap-based and
+            // only matches sections registered by register_overlays(), so this is a no-op for
+            // non-overlay ROM reads (asset/save data). Bounded to the fragment ROM window
+            // [0xA8A80, 0x437610) so the ~60 MB asset tail never enters the section scan.
+            {
+                uint32_t rom_off = physical_addr - recomp::rom_base;
+                constexpr uint32_t kFragRomLo = 0x000A8A80u;
+                constexpr uint32_t kFragRomHi = 0x00437610u;
+                // Skip the game's 0x18/0x20-byte header PEEK (it copies just the FRAGMENT header
+                // into a scratch buffer at ~0x807Fxxxx to read the fragment's size/reloc metadata,
+                // NOT an overlay load). Registering on the peek would map the fragment's funcs at
+                // the scratch address; only the subsequent full-body DMA to the real runtime base
+                // (size >= 0x100, observed 0x1000 chunks) is the actual overlay load. func_map is
+                // last-write-wins, but excluding the peek keeps stale scratch entries out entirely.
+                if (rom_off < kFragRomHi && (rom_off + size) > kFragRomLo && size >= 0x100) {
+                    load_overlays(rom_off, (int32_t)rdram_address, size);
+                }
+            }
 
             // Send a message to the mq to indicate that the transfer completed
             ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
