@@ -186,21 +186,31 @@ void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
 }
 
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
-    // Search for the first section that's included in the loaded rom range
-    // Sections were sorted by `init_overlays` so we can use the bounds functions
-    auto lower = std::lower_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], rom,
-        [](const SectionTableEntry& entry, uint32_t addr) {
-            return entry.rom_addr < addr;
+    // Load every code section whose ROM range [rom_addr, rom_addr+size) OVERLAPS the loaded
+    // window [rom, rom+size). Sections were sorted by rom_addr in `init_overlays`.
+    //
+    // This replaces the previous std::lower_bound/upper_bound pair, whose upper-bound predicate
+    // (`addr < entry.size + entry.rom_addr`) EXCLUDED a section that starts at/before `rom` but
+    // whose extent runs PAST `rom+size`: for such a section upper_bound returned begin(), giving
+    // an empty [lower,upper) range so NONE of its functions were registered in func_map. That is
+    // exactly the case for a flat game whose single base code section is larger than the boot
+    // 1MB window (this is the standard init() call load_overlays(0x1000, entrypoint, 1MB), and a
+    // ~1.4MB base .main section): the entrypoint's computed jump `jr $t2 -> 0x80000450`
+    // (LOOKUP_FUNC / get_function) then failed with "Failed to find function at 0x80000450"
+    // because the base section had never been loaded. Overlap selection loads the straddling
+    // base section correctly. Strictly additive for the flat single-section case (it only makes
+    // more base functions discoverable); load_overlays has a single caller (init()) and is not on
+    // any runtime DMA path, so this cannot perturb the overlay-DMA machinery.
+    const uint32_t win_lo = rom;
+    const uint32_t win_hi = rom + size;
+    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
+        const SectionTableEntry& section = sections_info.code_sections[i];
+        const uint32_t sec_lo = section.rom_addr;
+        const uint32_t sec_hi = section.rom_addr + section.size;
+        if (sec_lo < win_hi && sec_hi > win_lo) {
+            // ram of this section's base = its rom offset within the window, applied to ram_addr.
+            load_overlay(i, (int32_t)(section.rom_addr - rom) + ram_addr);
         }
-    );
-    auto upper = std::upper_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], (uint32_t)(rom + size),
-        [](uint32_t addr, const SectionTableEntry& entry) {
-            return addr < entry.size + entry.rom_addr;
-        }
-    );
-    // Load the overlays that were found
-    for (auto it = lower; it != upper; ++it) {
-        load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
     }
 }
 
