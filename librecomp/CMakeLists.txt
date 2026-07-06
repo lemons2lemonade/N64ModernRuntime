@@ -17,6 +17,7 @@ add_library(librecomp STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/flash.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/heap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/math_routines.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mmio.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_hooks.cpp"

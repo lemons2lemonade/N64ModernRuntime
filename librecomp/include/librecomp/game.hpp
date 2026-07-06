@@ -80,6 +80,16 @@ namespace recomp {
     std::span<const uint8_t> get_rom();
     void do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes);
     void do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr);
+
+    // Direct-MMIO register model (librecomp/src/mmio.cpp). Conventional games poll RCP + cartridge
+    // hardware registers directly (not via the osPi/osSi HLE); the flat-rdram model backs those
+    // addresses only as zeroed memory. mmio_init seeds the committed MMIO shadow with the correct
+    // values (RCP status = idle/ready; cartridge window = the real ROM bytes) so those direct reads
+    // resolve. Call once, after the ROM is loaded and before the game entrypoint runs.
+    void mmio_init(uint8_t* rdram);
+    uint32_t mmio_read(uint32_t vaddr, int size);
+    void mmio_write(uint32_t vaddr, int size, uint32_t val);
+    bool mmio_is_register(uint32_t vaddr);
     const Version& get_project_version();
 
     /// Specify the input configuration to the recomp runtime.

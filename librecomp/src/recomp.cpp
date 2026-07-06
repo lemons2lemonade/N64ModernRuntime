@@ -722,6 +722,13 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 save_type = game_entry.save_type;
                 ultramodern::init_saving(rdram);
 
+                // Seed the direct-MMIO register model into the committed shadow now that the ROM is
+                // loaded and rdram is committed. Conventional games poll RCP + cartridge hardware
+                // registers directly (e.g. Stadium 2's func_80064C20: PI_STATUS 0xA4600010 and the
+                // cartridge magic 0xB0000E38==0x828A; Paperboy's SI_STATUS 0xA4800018) — without
+                // this the flat-rdram model returns zeroed/garbage and those busy-waits never exit.
+                recomp::mmio_init(rdram);
+
                 try {
                     game_entry.entrypoint(rdram, context);
                 } catch (ultramodern::thread_terminated& terminated) {
