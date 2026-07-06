@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -371,9 +373,29 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+// Discovery mode (env RECOMP_FN_DISCOVERY): instead of exiting on a get_function miss, log every
+// distinct missing guest address to stderr (prefix "[fn-miss]") and return a no-op stub so the boot
+// keeps running and enumerates the FULL set of indirectly-called (jump-table / fn-ptr) addresses on
+// the reached path in a single pass. Used to drive the symbol_addrs promotion of fn-ptr targets for
+// the Paperboy scheduler-HLE boot (see paperboy-scheduler-hle-report.md). Off by default: normal
+// runs still hard-fail on a genuine missing function.
+static void fn_discovery_noop(uint8_t*, recomp_context*) {}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
+        static const bool discovery = std::getenv("RECOMP_FN_DISCOVERY") != nullptr;
+        if (discovery) {
+            // Guest threads call get_function concurrently; guard the dedup set (diagnostic path only).
+            static std::mutex seen_mutex;
+            static std::unordered_map<int32_t, bool> seen;
+            std::lock_guard<std::mutex> lk(seen_mutex);
+            if (!seen.count(addr)) {
+                seen[addr] = true;
+                fprintf(stderr, "[fn-miss] 0x%08X\n", (uint32_t)addr);
+            }
+            return fn_discovery_noop;
+        }
         fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
         assert(false);
         std::exit(EXIT_FAILURE);
