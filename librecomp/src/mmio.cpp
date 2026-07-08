@@ -41,6 +41,12 @@
 #include <span>
 #include <algorithm>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #include "recomp.h"
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
@@ -173,6 +179,52 @@ void mmio_init(uint8_t* rdram) {
     } else {
         std::fprintf(stderr, "[mmio] WARNING: ROM not loaded at mmio_init; cart-window reads will be 0\n");
     }
+}
+
+// General mechanism (see game.hpp): commit a KUSEG/KSEG band window in the reserved allocation and
+// optionally seed it with ROM bytes. The boot-time sibling of mmio_init for games with TLB-mapped
+// run-VRAM bands the flat model would otherwise leave PROT_NONE.
+bool commit_and_populate_window(uint8_t* rdram, uint32_t guest_vaddr, uint32_t size,
+                                uint32_t rom_src, uint32_t rom_len, uint32_t dst_off) {
+    // Flat rdram offset a guest vaddr maps to under MEM_*: (vaddr - 0x80000000) mod 2^32.
+    const uint64_t flat = (uint64_t)(uint32_t)(guest_vaddr - 0x80000000u);
+    // Page-align the protect range outward so a sub-page window still gets fully committed.
+    constexpr uint64_t pagesz = 0x1000ULL;
+    const uint64_t start = flat & ~(pagesz - 1);
+    const uint64_t end   = (flat + size + pagesz - 1) & ~(pagesz - 1);
+    if (end > recomp::allocation_size) {
+        std::fprintf(stderr, "[window] ERROR: guest 0x%08X window exceeds the rdram allocation\n", guest_vaddr);
+        return false;
+    }
+#ifdef _WIN32
+    DWORD old = 0;
+    if (VirtualProtect(rdram + start, (SIZE_T)(end - start), PAGE_READWRITE, &old) == 0) {
+        std::fprintf(stderr, "[window] ERROR: VirtualProtect failed for guest 0x%08X\n", guest_vaddr);
+        return false;
+    }
+#else
+    if (mprotect(rdram + start, (size_t)(end - start), PROT_READ | PROT_WRITE) == -1) {
+        std::perror("[window] mprotect");
+        return false;
+    }
+#endif
+    if (rom_len) {
+        std::span<const uint8_t> rom = recomp::get_rom();
+        if (rom.empty() || (size_t)rom_src + rom_len > rom.size()) {
+            std::fprintf(stderr, "[window] ERROR: ROM range 0x%X..0x%X out of bounds for guest 0x%08X\n",
+                         rom_src, rom_src + rom_len, guest_vaddr);
+            return false;
+        }
+        const uint8_t* src = rom.data() + rom_src;
+        const int64_t base = (int64_t)(int32_t)(guest_vaddr + dst_off);
+        for (uint32_t i = 0; i < rom_len; i++) {
+            MEM_B(i, base) = (int8_t)src[i];
+        }
+    }
+    std::fprintf(stderr, "[window] committed guest 0x%08X size 0x%X (flat 0x%llX..0x%llX)%s\n",
+                 guest_vaddr, size, (unsigned long long)start, (unsigned long long)end,
+                 rom_len ? " + ROM-populated" : "");
+    return true;
 }
 
 } // namespace recomp
