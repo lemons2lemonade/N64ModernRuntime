@@ -44,6 +44,11 @@ namespace recomp {
         size_t num_base_events();
 
         void add_loaded_function(int32_t ram_addr, recomp_func_t* func);
+        // Erase every func_map registration whose key (as a uint32 guest address) lies in
+        // [ram_start, ram_end). For consumers that corrective-re-register a mis-keyed section
+        // (see the GoldenEye bridge) and need the stale orphan keys gone, so a wild-pointer
+        // dispatch into the range aborts loudly instead of silently running the wrong function.
+        void erase_loaded_functions_in_range(uint32_t ram_start, uint32_t ram_end);
 
         struct BasePatchedFunction {
             size_t patch_section;

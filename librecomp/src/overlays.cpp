@@ -152,6 +152,18 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
     func_map[ram] = func;
 }
 
+void recomp::overlays::erase_loaded_functions_in_range(uint32_t ram_start, uint32_t ram_end) {
+    for (auto it = func_map.begin(); it != func_map.end();) {
+        uint32_t key = static_cast<uint32_t>(it->first);
+        if (key >= ram_start && key < ram_end) {
+            it = func_map.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
 void load_overlay(size_t section_table_index, int32_t ram) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
@@ -201,8 +213,10 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
     // (LOOKUP_FUNC / get_function) then failed with "Failed to find function at 0x80000450"
     // because the base section had never been loaded. Overlap selection loads the straddling
     // base section correctly. Strictly additive for the flat single-section case (it only makes
-    // more base functions discoverable); load_overlays has a single caller (init()) and is not on
-    // any runtime DMA path, so this cannot perturb the overlay-DMA machinery.
+    // more base functions discoverable); load_overlays has two callers — librecomp's init() boot
+    // load and the GoldenEye bridge's fabric_game_on_init corrective game-band re-load — both
+    // boot-time, so it is still not on any runtime DMA path and cannot perturb the overlay-DMA
+    // machinery.
     const uint32_t win_lo = rom;
     const uint32_t win_hi = rom + size;
     for (size_t i = 0; i < sections_info.num_code_sections; i++) {
