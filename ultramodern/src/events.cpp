@@ -129,6 +129,15 @@ static struct {
     std::mutex message_mutex;
     uint8_t* rdram;
     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
+    // Dedicated, priority channel for graphics tasks (M_GFXTASK). Kept SEPARATE from action_queue
+    // on purpose: the gfx thread's tokenless dequeue of action_queue heuristically drains the
+    // *largest* producer sub-queue first (concurrentqueue.h try_dequeue: it scores producers by
+    // size_approx() and pops from `best`). The VI thread enqueues a ScreenUpdateAction every retrace
+    // (60/s) and, whenever the renderer can't keep up, that sub-queue grows without bound — so a lone
+    // SpTaskAction sharing the queue is never the `best` producer and is starved indefinitely. Giving
+    // graphics tasks their own queue that the gfx thread drains with priority guarantees every posted
+    // gfx task is dispatched, while leaving ScreenUpdate/Config ordering in action_queue untouched.
+    moodycamel::ConcurrentQueue<SpTaskAction> gfx_task_queue{};
     moodycamel::BlockingConcurrentQueue<OSTask*> sp_task_queue{};
     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
 } events_context{};
@@ -356,36 +365,55 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
     // Notify the caller thread that this thread is ready.
     thread_ready->signal();
 
+    // Process one graphics task (M_GFXTASK). Body unchanged from the original in-line handler; only
+    // moved into a lambda so both the priority gfx_task_queue drain and the (now defensive)
+    // action_queue path can share it.
+    auto handle_gfx_task = [&](const SpTaskAction& task_action) {
+        // Turn on instant present if the game has been started and it hasn't been turned on yet.
+        if (ultramodern::is_game_started() && !enabled_instant_present) {
+            renderer_context->enable_instant_present();
+            enabled_instant_present = true;
+        }
+        // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+        // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+        // is finished as well, so sending this early shouldn't be an issue in most cases.
+        // If this causes issues then the logic can be replaced with responding to yield requests.
+        sp_complete();
+        ultramodern::measure_input_latency();
+
+        PTR(u64) displaylist = task_action.task.t.data_ptr;
+        ultramodern::extensions::on_displaylist_submitted(displaylist);
+
+        [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+        renderer_context->send_dl(&task_action.task);
+        [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+
+        dp_complete();
+        // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+        ultramodern::extensions::on_displaylist_parsed(displaylist);
+        ultramodern::extensions::on_displaylist_completed(displaylist);
+        // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+    };
+
     while (!exited) {
-        // Try to pull an action from the queue
+        // PRIORITY: drain every pending graphics task first, so the per-frame gfx task is never
+        // starved behind the VI thread's ScreenUpdateAction backlog. Normally at most one gfx task
+        // is in flight (the game blocks on RSP+RDP completion before posting the next).
+        SpTaskAction gfx_task;
+        while (events_context.gfx_task_queue.try_dequeue(gfx_task)) {
+            handle_gfx_task(gfx_task);
+        }
+
+        // Then service one screen-update / config action. These stay in action_queue in FIFO order
+        // (unchanged for all games); the 1ms timeout also bounds how long a freshly-posted gfx task
+        // waits when the action queue is momentarily empty.
         Action action;
         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
             // Determine the action type and act on it
             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
-                // Turn on instant present if the game has been started and it hasn't been turned on yet.
-                if (ultramodern::is_game_started() && !enabled_instant_present) {
-                    renderer_context->enable_instant_present();
-                    enabled_instant_present = true;
-                }
-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
-                // is finished as well, so sending this early shouldn't be an issue in most cases.
-                // If this causes issues then the logic can be replaced with responding to yield requests.
-                sp_complete();
-                ultramodern::measure_input_latency();
-
-                PTR(u64) displaylist = task_action->task.t.data_ptr;
-                ultramodern::extensions::on_displaylist_submitted(displaylist);
-
-                [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
-                renderer_context->send_dl(&task_action->task);
-                [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
-
-                dp_complete();
-                // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
-                ultramodern::extensions::on_displaylist_parsed(displaylist);
-                ultramodern::extensions::on_displaylist_completed(displaylist);
-                // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+                // Defensive: nothing routes gfx tasks through action_queue anymore, but if one ever
+                // arrives here, handle it identically rather than dropping it.
+                handle_gfx_task(*task_action);
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
                 events_context.vi.update_screen_regs = screen_update_action->regs;
@@ -564,9 +592,10 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
-    // Send gfx tasks to the graphics action queue
+    // Send gfx tasks to the dedicated, priority graphics-task queue (see gfx_task_queue comment):
+    // this keeps the lone per-frame gfx task from being starved behind the VI ScreenUpdate flood.
     if (task->t.type == M_GFXTASK) {
-        events_context.action_queue.enqueue(SpTaskAction{ *task });
+        events_context.gfx_task_queue.enqueue(SpTaskAction{ *task });
     }
     // Set all other tasks as the RSP task
     else {
