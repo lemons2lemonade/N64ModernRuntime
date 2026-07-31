@@ -244,13 +244,13 @@ void vi_thread_func() {
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
             remaining_retraces--;
-            
+
             std::lock_guard lock{ events_context.message_mutex };
             ViState* cur_state = events_context.vi.get_cur_state();
             if (remaining_retraces == 0) {
                 if (cur_state->mq != NULLPTR) {
                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
-                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
+                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next.
                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
                 }
                 remaining_retraces = cur_state->retrace_count;
@@ -374,11 +374,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
             renderer_context->enable_instant_present();
             enabled_instant_present = true;
         }
-        // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-        // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
-        // is finished as well, so sending this early shouldn't be an issue in most cases.
-        // If this causes issues then the logic can be replaced with responding to yield requests.
-        sp_complete();
         ultramodern::measure_input_latency();
 
         PTR(u64) displaylist = task_action.task.t.data_ptr;
@@ -388,6 +383,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
         renderer_context->send_dl(&task_action.task);
         [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
+        // Signal RSP complete only after send_dl has finished reading the display list from RDRAM.
+        // Games like GoldenEye reuse the DL buffer immediately on sp_complete — signaling before
+        // the read finishes causes a race (SIGBUS on uncommitted RDRAM).
+        sp_complete();
         dp_complete();
         // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
         ultramodern::extensions::on_displaylist_parsed(displaylist);
