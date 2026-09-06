@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <thread>
 #include <variant>
 #include <set>
@@ -15,10 +16,22 @@
 static std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
 // Offset of the duration since program start used to calculate the value for osGetTime. 
 static int64_t ostime_offset = 0;
-// Game speed multiplier (1 means no speedup)
-constexpr uint32_t speed_multiplier = 1;
+// Game speed multiplier (1 means no speedup).
+// MC_SPEED_MULT overrides at startup for headless fabric captures.
+static uint32_t speed_multiplier = 1;
 // N64 CPU counter ticks per millisecond
-constexpr uint32_t counter_per_ms = 46'875 * speed_multiplier;
+static uint32_t counter_per_ms = 46'875;
+
+static __attribute__((constructor)) void init_speed_mult() {
+    const char *env = getenv("MC_SPEED_MULT");
+    if (env) {
+        int v = atoi(env);
+        if (v > 0) {
+            speed_multiplier = (uint32_t)v;
+            counter_per_ms = 46'875 * speed_multiplier;
+        }
+    }
+}
 
 struct OSTimer {
     PTR(OSTimer) unused1;
