@@ -74,6 +74,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
 // MSVC/GCC/Clang ARM64
 #elif defined(__ARM_ARCH_ISA_A64)
 #   define IS_ARM64
+// Cortex-M33 (ARMv8-M, 32-bit Thumb-2) on the die
+#elif defined(N64_RECOMP_BAREMETAL)
+#   define IS_BAREMETAL
 #else
 #   error "Unsupported architecture!"
 #endif
@@ -165,6 +168,30 @@ void protect(void* target_func, uint64_t old_flags) {
         &dummy_old_flags);
     (void)result;
 }
+#elif defined(N64_RECOMP_BAREMETAL)
+// The die has no filesystem-loadable shared objects, so dynamic-library mods are
+// unsupported: DynamicLibrary is a never-good stub. Recompiled functions live in
+// XIP flash, so runtime code-patching (unprotect/protect) is a no-op here; wiring
+// on-die mod patching (a RAM shadow of patched functions) is a follow-up.
+class recomp::mods::DynamicLibrary {
+public:
+    static constexpr std::string_view PlatformExtension = ".so";
+    DynamicLibrary() = default;
+    DynamicLibrary(const std::filesystem::path&) {}
+    ~DynamicLibrary() = default;
+    DynamicLibrary(const DynamicLibrary&) = delete;
+    DynamicLibrary& operator=(const DynamicLibrary&) = delete;
+    DynamicLibrary(DynamicLibrary&&) = delete;
+    DynamicLibrary& operator=(DynamicLibrary&&) = delete;
+    void unload() {}
+    bool good() const { return false; }
+    template <typename T>
+    bool get_dll_symbol(T& out, const char*) const { out = nullptr; return false; }
+    uint32_t get_api_version() { return (uint32_t)-1; }
+};
+
+void unprotect(void*, uint64_t* old_flags) { *old_flags = 0; }
+void protect(void*, uint64_t) {}
 #else
 #  include <unistd.h>
 #  include <dlfcn.h>
@@ -582,6 +609,19 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
     std::visit(overloaded {
         [&write_bytes](recomp_func_t* native_func) {
            write_bytes(ldr_x2_8__br_x2, sizeof(ldr_x2_8__br_x2));
+           write_bytes(&native_func, sizeof(&native_func));
+        }
+    }, replacement_func);
+#elif defined(IS_BAREMETAL)
+    // Cortex-M33 Thumb-2 trampoline: `LDR.W PC, [PC, #0]` (loads the literal that
+    // immediately follows) then the 4-byte target address. The native function
+    // pointer already carries bit0=1 (Thumb), which BX/PC-load requires. This is
+    // architecturally correct for a RAM-resident target; patching XIP flash needs
+    // the RAM-shadow follow-up noted above.
+    static const uint8_t ldr_pc_pc[] = {0xDF, 0xF8, 0x00, 0xF0};
+    std::visit(overloaded {
+        [&write_bytes](recomp_func_t* native_func) {
+           write_bytes(ldr_pc_pc, sizeof(ldr_pc_pc));
            write_bytes(&native_func, sizeof(&native_func));
         }
     }, replacement_func);

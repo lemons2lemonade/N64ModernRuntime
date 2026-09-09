@@ -43,7 +43,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#else
+#elif !defined(N64_RECOMP_BAREMETAL)
 #include <sys/mman.h>
 #endif
 
@@ -202,6 +202,11 @@ bool commit_and_populate_window(uint8_t* rdram, uint32_t guest_vaddr, uint32_t s
         std::fprintf(stderr, "[window] ERROR: VirtualProtect failed for guest 0x%08X\n", guest_vaddr);
         return false;
     }
+#elif defined(N64_RECOMP_BAREMETAL)
+    // The die backs RDRAM with a flat, fully-committed 8MB PSRAM span (no
+    // PROT_NONE reservation), so there is nothing to un-protect; the range is
+    // already RW. (void) the bounds we computed only for the host path.
+    (void)start; (void)end;
 #else
     if (mprotect(rdram + start, (size_t)(end - start), PROT_READ | PROT_WRITE) == -1) {
         std::perror("[window] mprotect");
