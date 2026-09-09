@@ -62,6 +62,13 @@ namespace ultramodern {
             void* view;
             auto operator<=>(const WindowHandle&) const = default;
         };
+#else
+        // Bare-metal (CPU-die) build: there is no window. The RendererContext is
+        // stubbed (os_hooks' FabricRendererContext) and real output goes to the
+        // fabric/fast3d, so WindowHandle is vestigial -- an empty comparable handle.
+        struct WindowHandle {
+            auto operator<=>(const WindowHandle&) const = default;
+        };
 #endif
 
         enum class SetupResult {

@@ -5,7 +5,9 @@
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
+#if !defined(N64_RECOMP_BAREMETAL)
 #include "blockingconcurrentqueue.h"
+#endif
 
 #include "ultramodern/threads.hpp"
 
@@ -370,7 +372,43 @@ PTR(OSThread) ultramodern::this_thread() {
 }
 
 static std::thread thread_cleaner_thread;
+#if defined(N64_RECOMP_BAREMETAL)
+// Baremetal (CPU-die) cleaner queue: the moodycamel lock-free MPMC queue has no
+// bare-metal semaphore backend and pulls std::thread::id, none of which the die
+// needs -- the cleaner is a single low-rate consumer. This is a GTS-native ring
+// with a blocking dequeue (gts_sem), exposing only the two methods threads.cpp
+// uses (enqueue / wait_dequeue_timed). Host builds keep the moodycamel queue.
+extern "C" {
+#include "gts.h"
+}
+namespace {
+class BaremetalCleanerQueue {
+    static constexpr int CAP = 16;
+    UltraThreadContext* ring_[CAP];
+    int head_ = 0, count_ = 0;
+    gts_sem_t items_;
+public:
+    BaremetalCleanerQueue() { gts_sem_init(&items_, 0); }
+    void enqueue(UltraThreadContext* x) {
+        gts_preempt_disable();
+        if (count_ < CAP) { ring_[(head_ + count_) % CAP] = x; count_++; }
+        gts_preempt_enable();
+        gts_sem_signal(&items_);
+    }
+    template <class Dur>
+    bool wait_dequeue_timed(UltraThreadContext*& out, Dur /*unused on die*/) {
+        gts_sem_wait(&items_);                 // block until a thread is queued
+        gts_preempt_disable();
+        out = ring_[head_]; head_ = (head_ + 1) % CAP; count_--;
+        gts_preempt_enable();
+        return true;
+    }
+};
+}
+static BaremetalCleanerQueue deleted_threads{};
+#else
 static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{};
+#endif
 extern std::atomic_bool exited;
 
 void thread_cleaner_func() {
