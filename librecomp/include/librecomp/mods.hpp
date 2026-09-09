@@ -50,7 +50,9 @@ struct std::hash<recomp::mods::HookDefinition>
 {
     std::size_t operator()(const recomp::mods::HookDefinition& def) const {
         // This hash packing only works if the resulting value is 64 bits.
+#if !defined(N64_RECOMP_BAREMETAL)
         static_assert(sizeof(std::size_t) == 8);
+#endif  // on the 32-bit die the mod system is unused; this hash need only compile
         // Combine the three values into a single 64-bit value.
         // The lower 2 bits of a function address will always be zero, so pack
         // the value of at_return into the lowest bit.

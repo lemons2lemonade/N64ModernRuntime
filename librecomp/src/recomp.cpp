@@ -32,6 +32,13 @@
 // Bare-metal CPU die: no virtual memory / mman. RDRAM comes from a firmware seam.
 extern "C" uint8_t* recomp_baremetal_rdram(unsigned long bytes);
 extern "C" void     recomp_baremetal_rdram_free(uint8_t* p, unsigned long bytes);
+extern "C" void gts_yield(void);
+// C++20 std::atomic wait/notify has no bare-metal libstdc++ backend. On the
+// cooperative/preemptive die a wait is a yield-poll and a notify is implicit
+// (the poller re-reads after each yield). Correct for the game-start handshake.
+template <class A, class V> static inline void gts_atomic_wait(A& a, V old) {
+    while (a.load() == old) gts_yield();
+}
 #else
 #    include <sys/mman.h>
 #endif
@@ -562,7 +569,7 @@ void recomp::start_game(const std::u8string& game_id) {
     std::lock_guard<std::mutex> lock(current_game_mutex);
     current_game = game_id;
     game_status.store(GameStatus::Running);
-    game_status.notify_all();
+    // notify: implicit under the die yield-poll (gts_atomic_wait re-reads)
 }
 
 bool ultramodern::is_game_started() {
@@ -576,7 +583,9 @@ void ultramodern::quit() {
     exited.store(true);
     GameStatus desired = GameStatus::None;
     game_status.compare_exchange_strong(desired, GameStatus::Quit);
+#if !defined(N64_RECOMP_BAREMETAL)
     game_status.notify_all();
+#endif
     std::lock_guard<std::mutex> lock(current_game_mutex);
     current_game.reset();
 }
@@ -672,7 +681,11 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
 }
 
 bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+#if defined(N64_RECOMP_BAREMETAL)
+    gts_atomic_wait(game_status, GameStatus::None);
+#else
     game_status.wait(GameStatus::None);
+#endif
 
     switch (game_status.load()) {
         // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
