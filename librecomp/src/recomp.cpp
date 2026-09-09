@@ -28,6 +28,10 @@
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    include <Windows.h>
+#elif defined(N64_RECOMP_BAREMETAL)
+// Bare-metal CPU die: no virtual memory / mman. RDRAM comes from a firmware seam.
+extern "C" uint8_t* recomp_baremetal_rdram(unsigned long bytes);
+extern "C" void     recomp_baremetal_rdram_free(uint8_t* p, unsigned long bytes);
 #else
 #    include <sys/mman.h>
 #endif
@@ -823,7 +827,17 @@ void recomp::start(const recomp::Configuration& cfg) {
     constexpr size_t kseg1_size   = 0x20000000ULL; // 0xA0000000..0xBFFFFFFF (512MB)
     uint8_t* rdram;
     bool alloc_failed;
-#ifdef _WIN32
+#if defined(N64_RECOMP_BAREMETAL)
+    // W2: the die has no 512MB virtual reservation. RDRAM is a flat buffer the
+    // firmware backs with the cache-PSRAM window (recomp_baremetal_rdram). The
+    // host commits the full 512MB PHYS space as a zero catch-all; the die backs
+    // the real RDRAM and relies on the title being HLE-clean (the goldeneye/
+    // stadium2/goemon HLE bridges route I/O through libultra, not raw >8MB KSEG1
+    // MMIO). Guarding the >RDRAM range against strays is a hardware-MPU follow-up.
+    rdram = recomp_baremetal_rdram(allocation_size);
+    alloc_failed = (rdram == nullptr);
+    (void)kseg1_offset; (void)kseg1_size; (void)mem_size;
+#elif defined(_WIN32)
     rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
     DWORD old_protect = 0;
     alloc_failed = (rdram == nullptr);
@@ -898,7 +912,10 @@ void recomp::start(const recomp::Configuration& cfg) {
     
     // Free rdram.
     bool free_failed;
-#ifdef _WIN32
+#if defined(N64_RECOMP_BAREMETAL)
+    recomp_baremetal_rdram_free(rdram, allocation_size);
+    free_failed = false;
+#elif defined(_WIN32)
     // VirtualFree returns zero on failure.
     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
 #else
