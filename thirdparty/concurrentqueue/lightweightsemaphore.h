@@ -253,6 +253,30 @@ public:
 		}
 	}
 };
+#elif defined(N64_RECOMP_BAREMETAL)
+// Bare-metal (megaconsole CPU die): no OS semaphore. Back moodycamel's Semaphore
+// with the GTS scheduler's counting semaphore so the concurrentqueue's blocking
+// works on the cooperative/preemptive die. No wall clock, so timed_wait blocks
+// like wait (the die's queue consumers tolerate this). Only compiled under the
+// baremetal branch, so host builds never couple to GTS.
+extern "C" {
+#include "gts.h"
+}
+class Semaphore
+{
+private:
+	gts_sem_t m_sema;
+	Semaphore(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
+	Semaphore& operator=(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
+public:
+	Semaphore(int initialCount = 0) { gts_sem_init(&m_sema, initialCount); }
+	~Semaphore() {}
+	bool wait() { gts_sem_wait(&m_sema); return true; }
+	bool try_wait() { return gts_sem_trywait(&m_sema); }
+	bool timed_wait(std::uint64_t /*usecs*/) { gts_sem_wait(&m_sema); return true; }
+	void signal() { gts_sem_signal(&m_sema); }
+	void signal(int count) { while (count-- > 0) gts_sem_signal(&m_sema); }
+};
 #else
 #error Unsupported platform! (No semaphore wrapper available)
 #endif
