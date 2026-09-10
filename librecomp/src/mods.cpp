@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <cstdlib>       // std::abort for the bare-metal live-recompiler stubs
 
 #include "librecomp/files.hpp"
 #include "librecomp/mods.hpp"
@@ -503,6 +504,29 @@ recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_
     return CodeModLoadError::Good;
 }
 
+#if defined(N64_RECOMP_BAREMETAL)
+// Bare-metal: the live recompiler (MIPS->native JIT) is severed. These keep
+// LiveRecompilerCodeHandle's vtable complete -- ModContext holds
+// unique_ptr<LiveRecompilerCodeHandle> members, so the class's vtable and its
+// recompiler_output unique_ptr's ~LiveGeneratorOutput are referenced by the
+// destructor chain even though no handle is ever constructed (mods do not load
+// on the die). The bodies are unreachable at runtime, hence std::abort().
+recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+    const N64Recomp::Context&, const ModCodeHandleInputs&,
+    std::unordered_map<size_t, size_t>&&, std::unordered_map<size_t, size_t>&&,
+    std::vector<size_t>&&, bool) { std::abort(); }
+void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t, GenericFunction) { std::abort(); }
+recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_reference_symbols(const N64Recomp::Context&, std::string&) { std::abort(); }
+recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t) { std::abort(); }
+// Referenced by the code-handle unique_ptr dtor chain; JIT output is never
+// populated on the die, so a no-op destructor is correct.
+N64Recomp::LiveGeneratorOutput::~LiveGeneratorOutput() {}
+// ShimFunction builds a native trampoline for a mod import; unused on the die
+// (mods do not load). A null, non-polymorphic stub keeps the emplace_back import
+// sites linking; get_func() is inline in the header and returns the null func.
+N64Recomp::ShimFunction::ShimFunction(recomp_func_ext_t*, uintptr_t) : code(nullptr), func(nullptr) {}
+N64Recomp::ShimFunction::~ShimFunction() {}
+#else
 recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
     const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
     std::unordered_map<size_t, size_t>&& entry_func_hooks, std::unordered_map<size_t, size_t>&& return_func_hooks, std::vector<size_t>&& original_section_indices, bool regenerated)
@@ -581,6 +605,7 @@ recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_
 recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t func_index) {
     return GenericFunction{ recompiler_output->functions[func_index] };
 }
+#endif // N64_RECOMP_BAREMETAL
 
 void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replacement_func) {
     uint8_t* target_func_u8 = reinterpret_cast<uint8_t*>(target_func);
@@ -2044,6 +2069,13 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
 std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(RegeneratedList& regenlist, std::span<const uint8_t> rom) {
     using namespace recomp::mods;
 
+#if defined(N64_RECOMP_BAREMETAL)
+    // No live recompiler on the die: hook regeneration is unavailable. Unreached
+    // at runtime (mods do not load); returns null so no LiveRecompilerCodeHandle
+    // is instantiated.
+    (void)regenlist; (void)rom;
+    return {};
+#else
     std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle{};
 
     // Generate the recompiler context.
@@ -2088,6 +2120,7 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
     }
 
     return regenerated_code_handle;
+#endif // N64_RECOMP_BAREMETAL
 }
 
 std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regenerate_with_hooks(
@@ -2221,10 +2254,17 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t* 
     std::span<uint8_t> binary_span {reinterpret_cast<uint8_t*>(binary_data.data()), binary_data.size() };
 
     // Parse the symbol file into the recompiler context.
+#if defined(N64_RECOMP_BAREMETAL)
+    // Code-mod symbol parsing is part of the severed live-recompiler path; the
+    // die loads no code mods, so this is unreachable and reports unsupported.
+    (void)binary_span;
+    return CodeModLoadError::FailedToParseSyms;
+#else
     N64Recomp::ModSymbolsError symbol_load_error = N64Recomp::parse_mod_symbols(syms_data, binary_span, section_vrom_map, *mod.recompiler_context);
     if (symbol_load_error != N64Recomp::ModSymbolsError::Good) {
         return CodeModLoadError::FailedToParseSyms;
     }
+#endif
 
     // Prevent loading the mod if hooks aren't available and it has any hooks.
     if (!hooks_available && !mod.recompiler_context->hooks.empty()) {

@@ -94,7 +94,12 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
 }
 
 void recomp::mods::initialize_mods() {
+#if !defined(N64_RECOMP_BAREMETAL)
+    // The live recompiler is a MIPS->native JIT (sljit) used only to compile mod
+    // code at runtime; the die has no mods (and cannot JIT into XIP flash), so it
+    // is severed from the bare-metal build entirely.
     N64Recomp::live_recompiler_init();
+#endif
     std::filesystem::create_directories(config_path / mods_directory);
     std::filesystem::create_directories(config_path / mod_config_directory);
     mod_context->set_mods_config_path(config_path / "mods.json");
