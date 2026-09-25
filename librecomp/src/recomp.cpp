@@ -574,7 +574,11 @@ void recomp::start_game(const std::u8string& game_id) {
     std::lock_guard<std::mutex> lock(current_game_mutex);
     current_game = game_id;
     game_status.store(GameStatus::Running);
-    // notify: implicit under the die yield-poll (gts_atomic_wait re-reads)
+    // Baremetal: notify is implicit under the die yield-poll (gts_atomic_wait re-reads).
+    // Hosted: wait_for_game_started blocks in std::atomic::wait and needs the wake.
+#if !defined(N64_RECOMP_BAREMETAL)
+    game_status.notify_all();
+#endif
 }
 
 bool ultramodern::is_game_started() {
